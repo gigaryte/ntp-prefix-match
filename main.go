@@ -175,8 +175,11 @@ func main() {
 		} else if addr.IsIPv6() {
 			result = v6_trie.LongestPrefixMatch(addr)
 			if result != nil {
-				log.Infof("Found %v in result %v in v4 trie", addr, result)
+				log.Infof("Found %v in result %v in v6 trie", addr, result)
+				mu.Lock()
 				hitMap[result.String()][addr.String()]++
+				mu.Unlock()
+
 			}
 		}
 
