@@ -18,6 +18,8 @@ import (
 )
 
 var (
+	v4Queue    uint16
+	v6Queue    uint16
 	prefixFile string
 	tick       int
 	debug      bool
@@ -32,6 +34,8 @@ func init() {
 	flag.IntVarP(&tick, "time", "t", 3600, "Time to write prefix hits")
 	flag.BoolVarP(&debug, "verbose", "v", false, "Enable debug logging")
 	flag.StringVarP(&prefixFile, "prefixFile", "p", "", "IP prefixes to match")
+	flag.Uint16VarP(&v4Queue, "v4Queue", "4", 200, "IPv4 NFQUEUE queue number")
+	flag.Uint16VarP(&v6Queue, "v6Queue", "6", 100, "IPv6 NFQUEUE queue number")
 	flag.Parse()
 
 	if debug {
@@ -58,6 +62,7 @@ func init() {
 
 func main() {
 
+	// Create a v4 and v6 prefix trie
 	var v4_trie = ipaddr.Trie[*ipaddr.IPAddress]{}
 	var v6_trie = ipaddr.Trie[*ipaddr.IPAddress]{}
 
@@ -68,7 +73,7 @@ func main() {
 	defer f.Close()
 
 	// Create a map to track which IPs we've seen this interval
-	hitMap := make(map[string]map[string]uint)
+	hitMap := make(map[string]interface{})
 
 	// Build a v6/v4 prefix trie
 	scanner := bufio.NewScanner(f)
@@ -93,6 +98,9 @@ func main() {
 			mu.Lock()
 
 			currentTime := time.Now()
+
+			hitMap["timestamp"] = currentTime.Format(time.RFC3339)
+			hitMap["vp"] = host
 
 			jsonData, err := json.Marshal(hitMap)
 			if err != nil {
@@ -127,27 +135,43 @@ func main() {
 		}
 	}()
 
-	// Set configuration options for nfqueue
-	config := nfqueue.Config{
-		NfQueue:      200,
+	// Set configuration options for the IPv4 nfqueue
+	v4config := nfqueue.Config{
+		NfQueue:      v4Queue,
 		MaxPacketLen: 0xFFFFFF,
 		MaxQueueLen:  0xFFFFFFFF,
 		Copymode:     nfqueue.NfQnlCopyPacket,
 		WriteTimeout: 15 * time.Millisecond,
 	}
 
-	nf, err := nfqueue.Open(&config)
+	// Set configuration options for the IPv6 nfqueue
+	v6config := nfqueue.Config{
+		NfQueue:      v6Queue,
+		MaxPacketLen: 0xFFFFFF,
+		MaxQueueLen:  0xFFFFFFFF,
+		Copymode:     nfqueue.NfQnlCopyPacket,
+		WriteTimeout: 15 * time.Millisecond,
+	}
+
+	nf4, err := nfqueue.Open(&v4config)
 	if err != nil {
 		log.Fatalln("could not open nfqueue socket:", err)
 		return
 	}
-	defer nf.Close()
+	defer nf4.Close()
+
+	nf6, err := nfqueue.Open(&v6config)
+	if err != nil {
+		log.Fatalln("could not open nfqueue socket:", err)
+		return
+	}
+	defer nf6.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	//Callback for successful NFQUEUE packet
-	fn := func(a nfqueue.Attribute) int {
+	fn4 := func(a nfqueue.Attribute) int {
 		id := *a.PacketID
 		ntpPkt := gopacket.NewPacket(*a.Payload, layers.LayerTypeIPv4,
 			gopacket.Default)
@@ -163,24 +187,14 @@ func main() {
 		// Convert to ipaddr IP address
 		addr := ipaddr.NewIPAddressString(srcIP.String()).GetAddress()
 
-		// Check if the IP is in the trie depending on the IP version
-		if addr.IsIPv4() {
-			result = v4_trie.LongestPrefixMatch(addr)
-			if result != nil {
-				log.Infof("Found %v in result %v in v4 trie", addr, result)
-				mu.Lock()
-				hitMap[result.String()][addr.String()]++
-				mu.Unlock()
-			}
-		} else if addr.IsIPv6() {
-			result = v6_trie.LongestPrefixMatch(addr)
-			if result != nil {
-				log.Infof("Found %v in result %v in v4 trie", addr, result)
-				hitMap[result.String()][addr.String()]++
-			}
+		result = v4_trie.LongestPrefixMatch(addr)
+		if result != nil {
+			log.Infof("Found %v in result %v in v4 trie", addr, result)
+			mu.Lock()
+			hitMap[result.String()].(map[string]uint)[addr.String()]++
+			mu.Unlock()
 		}
-
-		nf.SetVerdict(id, nfqueue.NfAccept)
+		nf4.SetVerdict(id, nfqueue.NfAccept)
 		return 0
 	}
 
@@ -189,8 +203,44 @@ func main() {
 		return 0
 	}
 
-	// Register your function to listen on nflqueue queue 100
-	err = nf.RegisterWithErrorFunc(ctx, fn, errfn)
+	//Callback for successful IPv6 NFQUEUE packet
+	fn6 := func(a nfqueue.Attribute) int {
+		id := *a.PacketID
+		ntpPkt := gopacket.NewPacket(*a.Payload, layers.LayerTypeIPv6,
+			gopacket.Default)
+
+		//Pull out src IP
+		srcIP, _ := ntpPkt.NetworkLayer().NetworkFlow().Endpoints()
+
+		//fmt.Println("Src IP: ", srcIP)
+
+		// Result of trie lookup
+		var result *ipaddr.IPAddress
+
+		// Convert to ipaddr IP address
+		addr := ipaddr.NewIPAddressString(srcIP.String()).GetAddress()
+
+		result = v6_trie.LongestPrefixMatch(addr)
+		if result != nil {
+			log.Infof("Found %v in result %v in v6 trie", addr, result)
+			mu.Lock()
+			hitMap[result.String()].(map[string]uint)[addr.String()]++
+			mu.Unlock()
+		}
+
+		nf6.SetVerdict(id, nfqueue.NfAccept)
+		return 0
+	}
+
+	// Register your function to listen on the IPv4 nfqueue
+	err = nf4.RegisterWithErrorFunc(ctx, fn4, errfn)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	// Register your function to listen on the nfqueue
+	err = nf6.RegisterWithErrorFunc(ctx, fn6, errfn)
 	if err != nil {
 		log.Println(err)
 		return
